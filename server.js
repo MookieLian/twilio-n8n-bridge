@@ -24,8 +24,26 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// Root path handler for EasyPanel health checks
+app.get('/', (req, res) => {
+  logger.info({ path: req.path, method: req.method, headers: req.headers }, 'Root path accessed');
+  res.json({ 
+    status: 'running', 
+    timestamp: new Date().toISOString(),
+    port: PORT,
+    host: HOST,
+    endpoints: ['/health', '/ws/twilio', '/ws/n8n', '/socket.io']
+  });
+});
+
+// Catch-all handler for any other paths
 app.get('*', (req, res) => {
-  res.json({ status: 'running', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'running', 
+    timestamp: new Date().toISOString(),
+    path: req.path,
+    port: PORT
+  });
 });
 
 const server = http.createServer(app);
