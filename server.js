@@ -24,6 +24,10 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+app.get('*', (req, res) => {
+  res.json({ status: 'running', timestamp: new Date().toISOString() });
+});
+
 const server = http.createServer(app);
 
 // Socket.io for observability and optional client integrations
