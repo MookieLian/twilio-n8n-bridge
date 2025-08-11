@@ -11,7 +11,7 @@ const pino = require('pino');
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-const PORT = parseInt(process.env.PORT || '1971', 10);
+const PORT = parseInt(process.env.PORT || '80', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const WS_AUTH_TOKEN = process.env.WS_AUTH_TOKEN || '';
 
