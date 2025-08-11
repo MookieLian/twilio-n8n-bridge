@@ -96,11 +96,15 @@ connectOutboundN8n();
 // Handle HTTP upgrade to WS for our two raw WS paths
 server.on('upgrade', (request, socket, head) => {
   const { url } = request;
+  logger.info({ url, headers: request.headers }, 'WebSocket upgrade request');
+  
   if (url?.startsWith('/ws/twilio') || url?.startsWith('/ws/n8n')) {
+    logger.info({ url }, 'Processing WebSocket upgrade');
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
   } else {
+    logger.warn({ url }, 'Rejecting WebSocket upgrade - invalid path');
     socket.destroy();
   }
 });
@@ -116,9 +120,11 @@ wss.on('connection', (ws, request) => {
 
   // Optional simple bearer token via query param token=...
   if (WS_AUTH_TOKEN) {
+    logger.info({ clientId, path, hasToken: !!path.includes('token=') }, 'Checking token validation');
     const valid = hasValidToken(path, WS_AUTH_TOKEN);
+    logger.info({ clientId, valid }, 'Token validation result');
     if (!valid) {
-      logger.warn({ clientId }, 'Missing/invalid token, closing');
+      logger.warn({ clientId, path }, 'Missing/invalid token, closing connection');
       try { ws.close(1008, 'unauthorized'); } catch {}
       return;
     }
