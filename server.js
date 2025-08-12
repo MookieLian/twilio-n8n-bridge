@@ -12,6 +12,16 @@ const HOST = process.env.HOST || '0.0.0.0';
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const WS_AUTH_TOKEN = process.env.WS_AUTH_TOKEN || '';
 
+// Log configuration on startup
+logger.info({ 
+  port: PORT, 
+  host: HOST, 
+  hasWebhook: !!N8N_WEBHOOK_URL,
+  hasToken: !!WS_AUTH_TOKEN,
+  nodeVersion: process.version,
+  platform: process.platform
+}, 'Starting Twilio Media Streams Bridge');
+
 // Express app for health checks
 const app = express();
 app.get('/health', (req, res) => res.json({ status: 'ok', port: PORT }));
@@ -185,4 +195,26 @@ server.listen(PORT, HOST, () => {
   }
 });
 
+// Add error handling
+server.on('error', (err) => {
+  logger.error({ err: err.message, code: err.code }, 'Server error');
+  process.exit(1);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, shutting down gracefully');
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+});
 
