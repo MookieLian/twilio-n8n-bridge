@@ -1,139 +1,152 @@
-Twilio ↔ n8n Voice Bridge (WebSocket + Socket.io)
+# Twilio Media Streams Bridge
 
-A minimal Node.js service to bridge Twilio Media Streams to n8n. It:
+A lightweight Node.js service that bridges Twilio Media Streams to n8n webhooks for voice agent processing.
 
-- Accepts Twilio Media Streams over raw WebSocket at `/ws/twilio`
-- Lets n8n connect via raw WebSocket at `/ws/n8n` to receive Twilio frames and send control/media back
-- Optionally connects out to an n8n WebSocket (`N8N_WS_URL`) and/or POSTs frames to an n8n webhook (`N8N_WEBHOOK_URL`)
-- Exposes Socket.io on `/socket.io` for observability (events like `twilio:start`, `bridge:*`)
+## What it does
 
-Quick start (local)
+1. **Accepts Twilio Media Streams** over WebSocket at `/ws/twilio`
+2. **Buffers audio chunks** and forwards them to n8n via HTTP webhook
+3. **Streams audio data** in real-time as it arrives from Twilio
+4. **Maintains stream state** for each active call
 
-```
-npm i
-# or set PORT explicitly
-PORT=1971 npm run start
-# or
-npm run dev
-```
+## Quick Start
 
-Env vars (create `.env`):
-
-```
-PORT=1971
-HOST=0.0.0.0
-LOG_LEVEL=info
-# Optional simple auth for both WS paths: append ?token=... to URL
-WS_AUTH_TOKEN=changeme
-
-# Choose one or both for forwarding into n8n
-N8N_WS_URL=ws://your-n8n:5678
-N8N_WEBHOOK_URL=https://your-n8n/webhook/your-workflow
-
-# Socket.io CORS
-CORS_ORIGIN=*
+### Local Development
+```bash
+npm install
+npm start
 ```
 
-Twilio setup
-
-1. Expose this service publicly with TLS (e.g. via EasyPanel + HTTPS or a reverse proxy).
-2. Create a TwiML App pointing Twilio voice to your bridge WS, for example:
-
-```
-<wss url="wss://your-bridge.example.com/ws/twilio?token=changeme"/>
+### Docker
+```bash
+docker build -t twilio-bridge .
+docker run -p 3000:3000 -e N8N_WEBHOOK_URL=https://your-n8n.com/webhook/voice twilio-bridge
 ```
 
-Sample TwiML for a call:
+## Environment Variables
 
+```bash
+PORT=3000                    # Server port (default: 3000)
+HOST=0.0.0.0                # Server host (default: 0.0.0.0)
+LOG_LEVEL=info              # Logging level
+WS_AUTH_TOKEN=your-token    # Optional: WebSocket authentication token
+N8N_WEBHOOK_URL=https://your-n8n.com/webhook/voice  # n8n webhook endpoint
 ```
+
+## Twilio Setup
+
+### TwiML for Voice Calls
+```xml
 <Response>
   <Connect>
-    <Stream url="wss://your-bridge.example.com/ws/twilio?token=changeme" />
+    <Stream url="wss://your-bridge.com/ws/twilio?token=your-token">
+      <Parameter name="workflow" value="voice-agent" />
+    </Stream>
   </Connect>
-  </Response>
+</Response>
 ```
 
-Twilio will send frames as JSON: `start`, `media` (base64 audio), `stop`. The bridge ensures each call's `streamSid` is tracked and used for routing.
-
-n8n integration
-
-You have two options:
-
-- Inbound WS from n8n to the bridge: connect n8n websocket node to `wss://your-bridge/ws/n8n?token=changeme`. You will receive messages like:
-
+### WebSocket URL Format
 ```
+wss://your-bridge.com/ws/twilio?token=your-token
+```
+
+## n8n Integration
+
+### Webhook Payload Format
+
+**Media Chunk:**
+```json
 {
-  "source": "twilio",
-  "type": "media",
-  "streamSid": "MZxxxx",
-  "media": { "payload": "base64", "contentType": "audio/x-mulaw;rate=8000" }
-}
-```
-
-- Outbound WS to n8n: set `N8N_WS_URL`, the bridge will send the same payloads to that server.
-- HTTP webhook: set `N8N_WEBHOOK_URL`, the bridge will POST `{ data: "..." }` if payload is string, otherwise JSON.
-
-To send audio or control back from n8n to Twilio, send JSON to the bridge inbound n8n WS:
-
-```
-// send audio into the call (base64 payload)
-{
-  "type": "media",
+  "event": "media",
   "streamSid": "MZxxxx",
   "media": {
+    "payload": "base64-encoded-audio",
     "contentType": "audio/x-mulaw;rate=8000",
-    "payload": "...base64..."
+    "timestamp": 1234567890
   }
 }
 ```
 
-Other supported messages from n8n to Twilio:
-
-```
-{ "type": "mark", "streamSid": "MZxxxx", "mark": { "name": "ready" } }
-{ "type": "clear", "streamSid": "MZxxxx" }
-{ "type": "stop", "streamSid": "MZxxxx" }
-```
-
-Notes:
-- Ensure your audio format matches the Twilio stream (`audio/x-mulaw;rate=8000` by default).
-- Keep message sizes small; prefer streaming small chunks.
-
-Observability via Socket.io
-
-Connect to the same origin with Socket.io to observe events:
-
-- `ws:connected`, `ws:message`, `ws:closed`, `ws:error`
-- `twilio:start`, `twilio:tx`
-- `bridge:forwarded`, `bridge:dropped`, `bridge:error`
-
-Docker / EasyPanel
-
-Build and run:
-
-```
-docker build -t twilio-n8n-bridge .
-docker run -p 1971:1971 \
-  -e PORT=1971 -e HOST=0.0.0.0 \
-  -e WS_AUTH_TOKEN=changeme \
-  -e N8N_WS_URL=ws://n8n:5678 \
-  -e N8N_WEBHOOK_URL=https://n8n/webhook/flow \
-  twilio-n8n-bridge
+**Stream End:**
+```json
+{
+  "event": "stop",
+  "streamSid": "MZxxxx",
+  "finalBuffer": [...],
+  "duration": 15000
+}
 ```
 
-In EasyPanel, create an app from this Dockerfile, set the same env vars, and enable HTTPS. Point Twilio to the public WSS URL.
+### n8n Workflow Example
+1. **Webhook Trigger** - receives audio chunks
+2. **STT Node** - transcribes audio (Google Speech-to-Text, Deepgram, etc.)
+3. **AI Node** - processes transcript and generates response
+4. **TTS Node** - converts response to audio
+5. **HTTP Request** - sends audio back to Twilio (if needed)
 
-Security
+## Architecture
 
-- Use HTTPS/WSS only.
-- Set `WS_AUTH_TOKEN` and use `?token=...` in connection URLs.
-- Optionally restrict by IP at your proxy.
+```
+Twilio Call → Media Stream → Bridge → n8n Webhook → STT → AI → TTS
+```
 
-Endpoints
+- **Real-time streaming**: Audio chunks are processed as they arrive
+- **Stateful**: Each call maintains its own buffer and metadata
+- **Stateless**: n8n receives individual chunks, no persistent connection needed
+- **Scalable**: Multiple concurrent calls supported
 
-- Health: `GET /health`
-- Twilio WS: `wss://host/ws/twilio[?token=...]`
-- n8n WS inbound: `wss://host/ws/n8n[?token=...]`
-- Socket.io: `wss://host/socket.io`
+## Endpoints
+
+- `GET /` - Service status
+- `GET /health` - Health check
+- `WSS /ws/twilio` - Twilio Media Streams WebSocket
+
+## Security
+
+- Optional token-based authentication via `WS_AUTH_TOKEN`
+- Add `?token=your-token` to WebSocket URL
+- Use HTTPS/WSS in production
+
+## Deployment
+
+### EasyPanel
+1. Build and push Docker image
+2. Set environment variables in app settings
+3. Configure port mapping: `3000:3000`
+4. Enable HTTPS for production
+
+### Other Platforms
+- **Railway**: Deploy directly from GitHub
+- **Render**: Use Docker deployment
+- **DigitalOcean App Platform**: Container deployment
+- **AWS ECS**: Container orchestration
+
+## Testing
+
+### Test WebSocket Connection
+```bash
+# Install wscat
+npm install -g wscat
+
+# Connect to bridge
+wscat -c 'wss://your-bridge.com/ws/twilio?token=your-token'
+
+# Send test frame
+{"event":"start","start":{"streamSid":"TEST123"}}
+{"event":"media","streamSid":"TEST123","media":{"payload":"AAA=","contentType":"audio/x-mulaw;rate=8000"}}
+{"event":"stop","streamSid":"TEST123"}
+```
+
+## Troubleshooting
+
+- **Connection refused**: Check if bridge is running and port is accessible
+- **Token errors**: Verify `WS_AUTH_TOKEN` matches URL parameter
+- **n8n not receiving**: Check webhook URL and network connectivity
+- **Audio issues**: Ensure Twilio sends `audio/x-mulaw;rate=8000` format
+
+## License
+
+MIT
 
 

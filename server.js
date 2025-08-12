@@ -1,319 +1,188 @@
-// High-level: A small bridge that can accept Twilio Media Streams over raw WS,
-// relay messages to n8n (WS or HTTP), and expose Socket.io events for observability.
-
-require('dotenv').config();
 const http = require('http');
 const express = require('express');
-const { Server: IOServer } = require('socket.io');
 const WebSocket = require('ws');
 const axios = require('axios');
 const pino = require('pino');
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-const PORT = 80;
+// Configuration
+const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const WS_AUTH_TOKEN = process.env.WS_AUTH_TOKEN || '';
 
-// n8n destinations
-const N8N_WS_URL = process.env.N8N_WS_URL || '';
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
-
-// Express + HTTP server
+// Express app for health checks
 const app = express();
-app.use(express.json({ limit: '2mb' }));
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-// Root path handler for EasyPanel health checks
-app.get('/', (req, res) => {
-  logger.info({ path: req.path, method: req.method, headers: req.headers }, 'Root path accessed');
-  res.json({ 
-    status: 'running', 
-    timestamp: new Date().toISOString(),
-    port: PORT,
-    host: HOST,
-    endpoints: ['/health', '/ws/twilio', '/ws/n8n', '/socket.io']
-  });
-});
-
-// Catch-all handler for any other paths
-app.get('*', (req, res) => {
-  res.json({ 
-    status: 'running', 
-    timestamp: new Date().toISOString(),
-    path: req.path,
-    port: PORT
-  });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', port: PORT }));
+app.get('/', (req, res) => res.json({ 
+  status: 'Twilio Media Streams Bridge', 
+  port: PORT,
+  endpoints: ['/health', '/ws/twilio']
+}));
 
 const server = http.createServer(app);
 
-// Socket.io for observability and optional client integrations
-const io = new IOServer(server, {
-  cors: { origin: process.env.CORS_ORIGIN || '*', methods: ['GET', 'POST'] },
-});
-
-io.on('connection', (socket) => {
-  logger.info({ id: socket.id }, 'Socket.io client connected');
-  socket.emit('hello', { message: 'socket.io connected' });
-  socket.on('disconnect', () => logger.info({ id: socket.id }, 'Socket.io client disconnected'));
-});
-
-// Raw WebSocket servers
-// 1) Twilio Media Streams endpoint (expects raw WS, not Socket.io)
-// 2) n8n inbound clients connect here in a separate path
+// WebSocket server for Twilio Media Streams
 const wss = new WebSocket.Server({ noServer: true });
 
-// Per-stream routing
-const streamSidToTwilio = new Map(); // streamSid -> twilioWs
-const twilioWsToStreamSid = new Map(); // twilioWs -> streamSid
-const n8nInboundClients = new Set();
+// Track active Twilio streams
+const activeStreams = new Map(); // streamSid -> { ws, buffer, lastActivity }
 
-// Optional outbound n8n WS client
-let outboundN8nWs = null;
-function connectOutboundN8n() {
-  if (!N8N_WS_URL) return;
-  logger.info({ url: N8N_WS_URL }, 'Connecting to outbound n8n WS...');
-  const ws = new WebSocket(N8N_WS_URL);
-  ws.on('open', () => {
-    logger.info('Connected to n8n WS');
-    outboundN8nWs = ws;
-  });
-  ws.on('message', (data) => {
-    // Forward messages from n8n to any interested Socket.io observers
-    io.emit('n8n:message', safeToString(data));
-  });
-  ws.on('close', () => {
-    logger.warn('n8n WS disconnected');
-    outboundN8nWs = null;
-    // Reconnect with simple backoff
-    setTimeout(connectOutboundN8n, 2000);
-  });
-  ws.on('error', (err) => logger.error({ err }, 'n8n WS error'));
-}
-connectOutboundN8n();
-
-// Handle HTTP upgrade to WS for our two raw WS paths
+// Handle HTTP upgrade to WebSocket
 server.on('upgrade', (request, socket, head) => {
   const { url } = request;
-  logger.info({ url, headers: request.headers }, 'WebSocket upgrade request');
   
-  if (url?.startsWith('/ws/twilio') || url?.startsWith('/ws/n8n')) {
-    logger.info({ url }, 'Processing WebSocket upgrade');
+  if (url?.startsWith('/ws/twilio')) {
+    // Validate token if configured
+    if (WS_AUTH_TOKEN) {
+      const token = new URL(url, 'http://x').searchParams.get('token');
+      if (token !== WS_AUTH_TOKEN) {
+        logger.warn('Invalid token, closing connection');
+        socket.destroy();
+        return;
+      }
+    }
+    
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
   } else {
-    logger.warn({ url }, 'Rejecting WebSocket upgrade - invalid path');
     socket.destroy();
   }
 });
 
-// Simple routing based on request.url
+// Handle WebSocket connections
 wss.on('connection', (ws, request) => {
-  const path = request.url || '';
   const clientId = Math.random().toString(36).slice(2);
-  logger.info({ clientId, path }, 'WS connection established');
+  let currentStreamSid = null;
+  
+  logger.info({ clientId }, 'Twilio WebSocket connected');
 
-  // Emit to Socket.io observers
-  io.emit('ws:connected', { clientId, path });
-
-  // Optional simple bearer token via query param token=...
-  if (WS_AUTH_TOKEN) {
-    logger.info({ clientId, path, hasToken: !!path.includes('token=') }, 'Checking token validation');
-    const valid = hasValidToken(path, WS_AUTH_TOKEN);
-    logger.info({ clientId, valid }, 'Token validation result');
-    if (!valid) {
-      logger.warn({ clientId, path }, 'Missing/invalid token, closing connection');
-      try { ws.close(1008, 'unauthorized'); } catch {}
-      return;
-    }
-  }
-
-  const isTwilio = path.startsWith('/ws/twilio');
-  const isN8n = path.startsWith('/ws/n8n');
-  if (isN8n) n8nInboundClients.add(ws);
-
-  ws.on('message', async (data, isBinary) => {
-    const text = isBinary ? data.toString('utf8') : safeToString(data);
-    io.emit('ws:message', { clientId, path, payloadPreview: preview(text) });
-
-    if (isTwilio) {
-      // Expect Twilio Media Stream frames (JSON). Maintain streamSid mapping and forward to n8n.
-      try {
-        const frame = JSON.parse(text);
-        await handleTwilioFrame(ws, frame);
-      } catch (e) {
-        logger.warn({ clientId, err: e.message, text: preview(text) }, 'Non-JSON or invalid Twilio frame');
+  ws.on('message', async (data) => {
+    try {
+      const frame = JSON.parse(data.toString());
+      const event = frame.event;
+      
+      if (event === 'start') {
+        // New stream started
+        const streamSid = frame.start?.streamSid;
+        if (streamSid) {
+          currentStreamSid = streamSid;
+          activeStreams.set(streamSid, {
+            ws,
+            buffer: [],
+            lastActivity: Date.now(),
+            startTime: Date.now()
+          });
+          logger.info({ clientId, streamSid }, 'Stream started');
+        }
       }
-    } else if (isN8n) {
-      // Expect app-level control frames from n8n to Twilio
-      try {
-        const msg = JSON.parse(text);
-        await handleN8nInboundMessage(msg);
-      } catch (e) {
-        logger.warn({ clientId, err: e.message, text: preview(text) }, 'Invalid n8n message');
+      
+      else if (event === 'media') {
+        // Audio chunk received
+        const streamSid = frame.streamSid;
+        const media = frame.media;
+        
+        if (streamSid && media?.payload) {
+          const stream = activeStreams.get(streamSid);
+          if (stream) {
+            // Add to buffer
+            stream.buffer.push({
+              timestamp: Date.now(),
+              payload: media.payload,
+              contentType: media.contentType || 'audio/x-mulaw;rate=8000'
+            });
+            stream.lastActivity = Date.now();
+            
+            // Send to n8n webhook if configured
+            if (N8N_WEBHOOK_URL) {
+              try {
+                await axios.post(N8N_WEBHOOK_URL, {
+                  event: 'media',
+                  streamSid,
+                  media: {
+                    payload: media.payload,
+                    contentType: media.contentType || 'audio/x-mulaw;rate=8000',
+                    timestamp: Date.now()
+                  }
+                }, {
+                  timeout: 5000,
+                  headers: { 'Content-Type': 'application/json' }
+                });
+                logger.debug({ streamSid }, 'Sent to n8n webhook');
+              } catch (err) {
+                logger.error({ streamSid, err: err.message }, 'Failed to send to n8n');
+              }
+            }
+          }
+        }
       }
-    } else {
-      // Unknown path, ignore
+      
+      else if (event === 'stop') {
+        // Stream ended
+        const streamSid = frame.streamSid || currentStreamSid;
+        if (streamSid) {
+          const stream = activeStreams.get(streamSid);
+          if (stream) {
+            // Send final buffer to n8n
+            if (N8N_WEBHOOK_URL && stream.buffer.length > 0) {
+              try {
+                await axios.post(N8N_WEBHOOK_URL, {
+                  event: 'stop',
+                  streamSid,
+                  finalBuffer: stream.buffer,
+                  duration: Date.now() - stream.startTime
+                }, {
+                  timeout: 5000,
+                  headers: { 'Content-Type': 'application/json' }
+                });
+              } catch (err) {
+                logger.error({ streamSid, err: err.message }, 'Failed to send final buffer');
+              }
+            }
+            
+            activeStreams.delete(streamSid);
+            logger.info({ clientId, streamSid }, 'Stream stopped');
+          }
+        }
+      }
+      
+    } catch (err) {
+      logger.warn({ clientId, err: err.message }, 'Invalid frame received');
     }
   });
 
   ws.on('close', () => {
-    logger.info({ clientId }, 'WS connection closed');
-    io.emit('ws:closed', { clientId, path });
-    if (isN8n) n8nInboundClients.delete(ws);
-    if (isTwilio) detachTwilio(ws);
+    if (currentStreamSid) {
+      activeStreams.delete(currentStreamSid);
+    }
+    logger.info({ clientId }, 'WebSocket disconnected');
   });
 
   ws.on('error', (err) => {
-    logger.error({ clientId, err }, 'WS connection error');
-    io.emit('ws:error', { clientId, error: err.message });
+    logger.error({ clientId, err: err.message }, 'WebSocket error');
   });
 });
 
-async function forwardToN8n(payload) {
-  // 1) Prefer outbound WS if configured and open
-  if (outboundN8nWs && outboundN8nWs.readyState === WebSocket.OPEN) {
-    outboundN8nWs.send(payload);
-    return 'ws';
-  }
-  // 2) Fallback to HTTP POST webhook if configured
-  if (N8N_WEBHOOK_URL) {
-    await axios.post(N8N_WEBHOOK_URL, typeof payload === 'string' ? { data: payload } : payload, {
-      timeout: 10000,
-      headers: { 'Content-Type': 'application/json' },
-    });
-    return 'http';
-  }
-  return null;
-}
-
-function hasValidToken(path, token) {
-  try {
-    const u = new URL(path, 'http://x');
-    return u.searchParams.get('token') === token;
-  } catch {
-    return false;
-  }
-}
-
-function detachTwilio(twilioWs) {
-  const sid = twilioWsToStreamSid.get(twilioWs);
-  if (sid) {
-    streamSidToTwilio.delete(sid);
-    twilioWsToStreamSid.delete(twilioWs);
-    io.emit('twilio:detached', { streamSid: sid });
-  }
-}
-
-async function handleTwilioFrame(ws, frame) {
-  const event = frame.event;
-  if (event === 'start') {
-    const sid = frame.start?.streamSid;
-    if (sid) {
-      streamSidToTwilio.set(sid, ws);
-      twilioWsToStreamSid.set(ws, sid);
-      io.emit('twilio:start', { streamSid: sid, start: frame.start });
-      // Tell observers
-      await forwardToN8n(JSON.stringify({ source: 'twilio', type: 'start', streamSid: sid, start: frame.start }));
-    }
-    return;
-  }
-  if (event === 'media') {
-    const sid = frame.streamSid;
-    const media = frame.media;
-    // Forward as-is to n8n listeners
-    const payload = JSON.stringify({ source: 'twilio', type: 'media', streamSid: sid, media });
-    await forwardToN8n(payload);
-    broadcastToInboundN8n(payload);
-    return;
-  }
-  if (event === 'stop') {
-    const sid = frame.streamSid || twilioWsToStreamSid.get(ws);
-    await forwardToN8n(JSON.stringify({ source: 'twilio', type: 'stop', streamSid: sid }));
-    broadcastToInboundN8n(JSON.stringify({ source: 'twilio', type: 'stop', streamSid: sid }));
-    detachTwilio(ws);
-    return;
-  }
-  // Forward any other events generically
-  await forwardToN8n(JSON.stringify({ source: 'twilio', type: event, ...frame }));
-  broadcastToInboundN8n(JSON.stringify({ source: 'twilio', type: event, ...frame }));
-}
-
-function broadcastToInboundN8n(text) {
-  for (const client of n8nInboundClients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(text);
+// Cleanup inactive streams every 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  for (const [streamSid, stream] of activeStreams.entries()) {
+    if (now - stream.lastActivity > 30000) { // 30 seconds
+      logger.info({ streamSid }, 'Cleaning up inactive stream');
+      activeStreams.delete(streamSid);
     }
   }
-}
+}, 30000);
 
-async function handleN8nInboundMessage(msg) {
-  // Expected shapes:
-  // { type: 'media', streamSid, media: { contentType: 'audio/x-mulaw;rate=8000', payload: base64 } }
-  // { type: 'mark', streamSid, mark: { name: 'xyz' } }
-  // { type: 'clear', streamSid }
-  const type = msg.type;
-  const sid = msg.streamSid;
-  if (!sid) return;
-  const twilioWs = streamSidToTwilio.get(sid);
-  if (!twilioWs || twilioWs.readyState !== WebSocket.OPEN) return;
-
-  if (type === 'media' && msg.media?.payload) {
-    const frame = {
-      event: 'media',
-      streamSid: sid,
-      media: {
-        contentType: msg.media.contentType || 'audio/x-mulaw;rate=8000',
-        payload: msg.media.payload,
-      },
-    };
-    twilioWs.send(JSON.stringify(frame));
-    io.emit('twilio:tx', { streamSid: sid, bytes: byteLength(JSON.stringify(frame)) });
-    return;
-  }
-  if (type === 'mark' && msg.mark?.name) {
-    const frame = { event: 'mark', streamSid: sid, mark: { name: msg.mark.name } };
-    twilioWs.send(JSON.stringify(frame));
-    return;
-  }
-  if (type === 'clear') {
-    const frame = { event: 'clear', streamSid: sid };
-    twilioWs.send(JSON.stringify(frame));
-    return;
-  }
-  if (type === 'stop') {
-    const frame = { event: 'stop', streamSid: sid };
-    twilioWs.send(JSON.stringify(frame));
-    return;
-  }
-}
-
-function safeToString(data) {
-  try {
-    if (Buffer.isBuffer(data)) return data.toString('utf8');
-    if (typeof data === 'string') return data;
-    return JSON.stringify(data);
-  } catch (e) {
-    return '[binary]';
-  }
-}
-
-function preview(data, max = 200) {
-  const s = typeof data === 'string' ? data : '[binary]';
-  return s.length > max ? `${s.slice(0, max)}…(${s.length} bytes)` : s;
-}
-
-function byteLength(data) {
-  if (typeof data === 'string') return Buffer.byteLength(data, 'utf8');
-  if (Buffer.isBuffer(data)) return data.length;
-  return Buffer.byteLength(JSON.stringify(data), 'utf8');
-}
-
+// Start server
 server.listen(PORT, HOST, () => {
-  logger.info({ port: PORT, host: HOST }, 'Server listening');
-  logger.info('WS endpoints: /ws/twilio, /ws/n8n');
+  logger.info({ port: PORT, host: HOST }, 'Twilio Media Streams Bridge started');
+  logger.info('WebSocket endpoint: /ws/twilio');
+  if (N8N_WEBHOOK_URL) {
+    logger.info('n8n webhook configured');
+  }
 });
 
 
